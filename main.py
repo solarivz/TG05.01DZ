@@ -9,21 +9,21 @@ from config import TOKEN, WS_URL, ADMIN_CHAT_ID
 import websockets
 
 # Настройка логирования для отслеживания событий бота
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("aiogram")  # Логгер для записи действий бота
 
 # Инициализация бота с токеном из конфига
 bot = Bot(token=TOKEN)  # Создаем экземпляр бота для взаимодействия с Telegram API
 dp = Dispatcher()  # Диспетчер для обработки входящих сообщений
 
-# Расширенный список валидных торговых пар
+# Обновленный список валидных торговых пар (основан на популярных парах EXMO)
 VALID_TRADING_PAIRS = [
     "ETH_USDT", "BTC_USDT", "LTC_USD", "XRP_USDT", "ADA_USDT",
-    "DOGE_USDT", "BNB_USDT", "SOL_USDT", "DOT_USDT", "AVAX_USDT"
+    "DOGE_USDT", "BNB_USDT", "SOL_USDT"  # Убраны сомнительные пары, оставлены проверенные
 ]
 
-# Глобальный словарь для хранения данных о сделках
-trade_data = {}
+# Глобальные словари для хранения данных
+trade_data = {}  # Данные о сделках
 # Флаг для отслеживания состояния подключения
 is_connected = False
 
@@ -37,7 +37,6 @@ async def websocket_handler():
             async with websockets.connect(uri) as websocket:
                 is_connected = True
                 logger.info("WebSocket соединение успешно установлено")
-                # Уведомление об успешном подключении (с обработкой ошибки)
                 try:
                     await bot.send_message(chat_id=ADMIN_CHAT_ID, text="✅ WebSocket подключен к EXMO!")
                 except TelegramBadRequest as e:
@@ -50,23 +49,30 @@ async def websocket_handler():
                     "topics": [f"spot/trades:{pair}" for pair in VALID_TRADING_PAIRS]
                 }
                 await websocket.send(json.dumps(subscribe_msg))
-                logger.info("Подписка на данные о торгах отправлена")
+                logger.info(f"Отправлено сообщение подписки: {json.dumps(subscribe_msg)}")
 
                 while True:
                     message = await websocket.recv()
-                    data = json.loads(message)
-                    logger.debug(f"Получено сообщение: {data}")
-                    if "data" in data and "trades" in data["data"]:
-                        for trade in data["data"]["trades"]:
-                            pair = trade.get("pair", "").replace("-", "_")
-                            if pair in VALID_TRADING_PAIRS:
-                                if pair not in trade_data:
-                                    trade_data[pair] = []
-                                trade_data[pair].append(trade)
-                                trade_data[pair] = trade_data[pair][-10:]  # Ограничиваем до 10 сделок
-                                logger.info(f"Обновлены данные по паре {pair}")
-                    elif "code" in data and data["code"] == 1:
-                        logger.info("Подписка на данные успешно подтверждена")
+                    logger.debug(f"Получено необработанное сообщение: {message}")
+                    try:
+                        data = json.loads(message)
+                        logger.debug(f"Распарсено сообщение: {data}")
+                        if "data" in data and "trades" in data["data"]:
+                            for trade in data["data"]["trades"]:
+                                pair = trade.get("pair", "").replace("-", "_")
+                                if pair in VALID_TRADING_PAIRS:
+                                    if pair not in trade_data:
+                                        trade_data[pair] = []
+                                    trade_data[pair].append(trade)
+                                    trade_data[pair] = trade_data[pair][-10:]  # Ограничиваем до 10 сделок
+                                    logger.info(f"Обновлены данные по паре {pair}: {trade}")
+                        elif "event" in data and data["event"] == "error":
+                            logger.warning(f"Ошибка от сервера: {data}")
+                            # Продолжаем обработку других пар, игнорируя ошибочные
+                        elif "code" in data and data["code"] == 1:
+                            logger.info("Подписка на данные успешно подтверждена")
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Ошибка декодирования JSON: {e}, сообщение: {message}")
 
         except websockets.ConnectionClosed as e:
             is_connected = False
@@ -100,7 +106,7 @@ async def get_chat_id(message: Message):
     await message.answer(f"Ваш chat_id: {message.chat.id}")
 
 
-# Хэндлер для обработки команды /Trades с указанием пары
+# Хэндлер для обработки команды /Trades
 @dp.message(Command("Trades"))
 async def get_trades_handler(message: Message):
     parts = message.text.split(maxsplit=1)
@@ -121,11 +127,12 @@ async def get_trades_handler(message: Message):
     trades = trade_data.get(trading_pair, [])
     if not trades:
         await message.answer(
-            f"Данные о сделках по паре {trading_pair.replace('_', '/')} еще не получены. Подождите немного.")
+            f"Данные о сделках по паре {trading_pair.replace('_', '/')} еще не получены. Подождите немного или проверьте логи.")
         return
 
+    # Формируем ответ с информацией о сделках
     response_text = f"Последние сделки по паре {trading_pair.replace('_', '/')}:\n\n"
-    for trade in trades[-3:]:
+    for trade in trades[-3:]:  # Берем последние 3 сделки
         response_text += (
             f"⏰ Время: {trade.get('date', 'N/A')}\n"
             f"💰 Цена: {trade.get('price', 'N/A')} {trading_pair.split('_')[1]}\n"

@@ -1,158 +1,150 @@
+from config_class import TOKEN
 import asyncio
 import logging
-import json
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import Message
-from aiogram.exceptions import TelegramBadRequest
-from config import TOKEN, WS_URL, ADMIN_CHAT_ID
-import websockets
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+import aiohttp
+import datetime
+from deep_translator import GoogleTranslator
 
-# Настройка логирования для отслеживания событий бота
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("aiogram")  # Логгер для записи действий бота
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Инициализация бота с токеном из конфига
-bot = Bot(token=TOKEN)  # Создаем экземпляр бота для взаимодействия с Telegram API
-dp = Dispatcher()  # Диспетчер для обработки входящих сообщений
+# Конфигурация
+NUMBERS_API_URL = "http://numbersapi.com/"
+translator = GoogleTranslator(source='auto', target='ru')
 
-# Обновленный список валидных торговых пар (основан на популярных парах EXMO)
-VALID_TRADING_PAIRS = [
-    "ETH_USDT", "BTC_USDT", "LTC_USD", "XRP_USDT", "ADA_USDT",
-    "DOGE_USDT", "BNB_USDT", "SOL_USDT"  # Убраны сомнительные пары, оставлены проверенные
-]
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
 
-# Глобальные словари для хранения данных
-trade_data = {}  # Данные о сделках
-# Флаг для отслеживания состояния подключения
-is_connected = False
+# Определяем состояния
+class Form(StatesGroup):
+    waiting_for_number = State()
+    waiting_for_date = State()
+    waiting_for_year = State()
+    waiting_for_math = State()
 
-
-# Асинхронная функция для обработки WebSocket-соединения с диагностикой
-async def websocket_handler():
-    global trade_data, is_connected
-    while True:
-        try:
-            uri = WS_URL
-            async with websockets.connect(uri) as websocket:
-                is_connected = True
-                logger.info("WebSocket соединение успешно установлено")
-                try:
-                    await bot.send_message(chat_id=ADMIN_CHAT_ID, text="✅ WebSocket подключен к EXMO!")
-                except TelegramBadRequest as e:
-                    logger.error(f"Не удалось отправить уведомление: {e}")
-
-                # Сообщение для подписки на данные о торгах
-                subscribe_msg = {
-                    "id": 1,
-                    "method": "subscribe",
-                    "topics": [f"spot/trades:{pair}" for pair in VALID_TRADING_PAIRS]
-                }
-                await websocket.send(json.dumps(subscribe_msg))
-                logger.info(f"Отправлено сообщение подписки: {json.dumps(subscribe_msg)}")
-
-                while True:
-                    message = await websocket.recv()
-                    logger.debug(f"Получено необработанное сообщение: {message}")
-                    try:
-                        data = json.loads(message)
-                        logger.debug(f"Распарсено сообщение: {data}")
-                        if "data" in data and "trades" in data["data"]:
-                            for trade in data["data"]["trades"]:
-                                pair = trade.get("pair", "").replace("-", "_")
-                                if pair in VALID_TRADING_PAIRS:
-                                    if pair not in trade_data:
-                                        trade_data[pair] = []
-                                    trade_data[pair].append(trade)
-                                    trade_data[pair] = trade_data[pair][-10:]  # Ограничиваем до 10 сделок
-                                    logger.info(f"Обновлены данные по паре {pair}: {trade}")
-                        elif "event" in data and data["event"] == "error":
-                            logger.warning(f"Ошибка от сервера: {data}")
-                            # Продолжаем обработку других пар, игнорируя ошибочные
-                        elif "code" in data and data["code"] == 1:
-                            logger.info("Подписка на данные успешно подтверждена")
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Ошибка декодирования JSON: {e}, сообщение: {message}")
-
-        except websockets.ConnectionClosed as e:
-            is_connected = False
-            logger.error(f"WebSocket соединение разорвано: {e}")
-            try:
-                await bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"❌ WebSocket разорвано: {e}")
-            except TelegramBadRequest as e:
-                logger.error(f"Не удалось отправить уведомление: {e}")
-            await asyncio.sleep(5)
-        except websockets.WebSocketException as e:
-            is_connected = False
-            logger.error(f"Ошибка WebSocket: {e}")
-            try:
-                await bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"❌ Ошибка WebSocket: {e}")
-            except TelegramBadRequest as e:
-                logger.error(f"Не удалось отправить уведомление: {e}")
-            await asyncio.sleep(5)
-        except Exception as e:
-            is_connected = False
-            logger.error(f"Неизвестная ошибка WebSocket: {e}")
-            try:
-                await bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"❌ Ошибка: {e}")
-            except TelegramBadRequest as e:
-                logger.error(f"Не удалось отправить уведомление: {e}")
-            await asyncio.sleep(5)
-
-
-# Хэндлер для получения chat_id
-@dp.message(Command("getid"))
-async def get_chat_id(message: Message):
-    await message.answer(f"Ваш chat_id: {message.chat.id}")
-
-
-# Хэндлер для обработки команды /Trades
-@dp.message(Command("Trades"))
-async def get_trades_handler(message: Message):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer("Пожалуйста, укажите торговую пару, например: /Trades ETH/USDT")
-        return
-
-    trading_pair = parts[1].strip().upper().replace("/", "_")
-
-    if trading_pair not in VALID_TRADING_PAIRS:
-        await message.answer(f"Пара {trading_pair} не поддерживается. Доступные пары: {', '.join(VALID_TRADING_PAIRS)}")
-        return
-
-    if not is_connected:
-        await message.answer("⚠️ WebSocket не подключен. Данные недоступны.")
-        return
-
-    trades = trade_data.get(trading_pair, [])
-    if not trades:
-        await message.answer(
-            f"Данные о сделках по паре {trading_pair.replace('_', '/')} еще не получены. Подождите немного или проверьте логи.")
-        return
-
-    # Формируем ответ с информацией о сделках
-    response_text = f"Последние сделки по паре {trading_pair.replace('_', '/')}:\n\n"
-    for trade in trades[-3:]:  # Берем последние 3 сделки
-        response_text += (
-            f"⏰ Время: {trade.get('date', 'N/A')}\n"
-            f"💰 Цена: {trade.get('price', 'N/A')} {trading_pair.split('_')[1]}\n"
-            f"📊 Объем: {trade.get('quantity', 'N/A')} {trading_pair.split('_')[0]}\n"
-            f"🔄 Тип: {trade.get('type', 'N/A')}\n"
-            f"--------------------\n"
-        )
-
-    await message.answer(response_text)
-
-
-# Главная асинхронная функция для запуска бота и WebSocket
-async def main():
+async def translate_to_russian(text: str) -> str:
+    """Переводит текст на русский язык"""
     try:
-        logger.info("Бот и WebSocket запущены!")
-        asyncio.create_task(websocket_handler())
-        await dp.start_polling(bot)
+        return translator.translate(text)
     except Exception as e:
-        logger.error(f"Ошибка при запуске: {e}")
+        logger.error(f"Ошибка перевода: {e}")
+        return text
 
+async def get_number_fact(number: str, fact_type: str = "trivia") -> str:
+    """Получаем факт о числе"""
+    url = f"{NUMBERS_API_URL}{number}/{fact_type}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    fact = await response.text()
+                    return await translate_to_russian(fact)
+                return "Не удалось получить факт о числе. Попробуйте другое число."
+    except Exception as e:
+        logger.error(f"Ошибка при запросе к NumbersAPI: {e}")
+        return "Произошла ошибка при получении данных. Попробуйте позже."
+
+@dp.message(Command("getnumber"))
+async def get_number_command(message: types.Message, state: FSMContext):
+    """Обработчик команды /getnumber"""
+    await message.answer("Введите число, и я расскажу вам интересный факт о нём:")
+    await state.set_state(Form.waiting_for_number)
+
+@dp.message(Form.waiting_for_number)
+async def process_number(message: types.Message, state: FSMContext):
+    """Обработчик ввода числа"""
+    number = message.text.strip()
+    if number.lstrip('-').isdigit():
+        fact = await get_number_fact(number)
+        await message.answer(f"🔢 Факт о числе {number}:\n\n{fact}")
+    else:
+        await message.answer("Пожалуйста, введите корректное целое число.")
+    await state.clear()
+
+@dp.message(Command("getdate"))
+async def get_date_command(message: types.Message, state: FSMContext):
+    """Обработчик команды /getdate"""
+    await message.answer("Введите дату в формате ДД.ММ (например, 29.02), и я расскажу интересный факт об этом дне:")
+    await state.set_state(Form.waiting_for_date)
+
+@dp.message(Form.waiting_for_date)
+async def process_date(message: types.Message, state: FSMContext):
+    """Обработчик ввода даты"""
+    date_input = message.text.strip()
+    try:
+        day, month = map(int, date_input.split('.'))
+        test_date = datetime.date(2020, month, day)  # Проверка даты
+        fact = await get_number_fact(f"{month}/{day}", "date")
+        await message.answer(f"📅 Факт о дате {day:02d}.{month:02d}:\n\n{fact}")
+    except ValueError:
+        await message.answer("Пожалуйста, введите дату в правильном формате (ДД.ММ).")
+    except Exception as e:
+        logger.error(f"Ошибка обработки даты: {e}")
+        await message.answer("Неверный формат даты. Попробуйте снова.")
+    await state.clear()
+
+@dp.message(Command("getyear"))
+async def get_year_command(message: types.Message, state: FSMContext):
+    """Обработчик команды /getyear"""
+    await message.answer("Введите год (4 цифры), и я расскажу интересный факт о нём:")
+    await state.set_state(Form.waiting_for_year)
+
+@dp.message(Form.waiting_for_year)
+async def process_year(message: types.Message, state: FSMContext):
+    """Обработчик ввода года"""
+    year = message.text.strip()
+    if year.isdigit() and len(year) == 4 and 0 < int(year) <= datetime.datetime.now().year + 10:
+        fact = await get_number_fact(year, "year")
+        await message.answer(f"📅 Факт о {year} годе:\n\n{fact}")
+    else:
+        await message.answer("Пожалуйста, введите корректный год (4 цифры, не более 10 лет вперед от текущего).")
+    await state.clear()
+
+@dp.message(Command("getmath"))
+async def get_math_command(message: types.Message, state: FSMContext):
+    """Обработчик команды /getmath"""
+    await message.answer("Введите число, и я расскажу математический факт о нём:")
+    await state.set_state(Form.waiting_for_math)
+
+@dp.message(Form.waiting_for_math)
+async def process_math(message: types.Message, state: FSMContext):
+    """Обработчик ввода числа для математического факта"""
+    number = message.text.strip()
+    if number.lstrip('-').isdigit():
+        fact = await get_number_fact(number, "math")
+        await message.answer(f"➕ Математический факт о {number}:\n\n{fact}")
+    else:
+        await message.answer("Пожалуйста, введите корректное число.")
+    await state.clear()
+
+@dp.message(Command("getrandom"))
+async def get_random_command(message: types.Message):
+    """Обработчик команды /getrandom"""
+    fact = await get_number_fact("random")
+    await message.answer(f"🎲 Случайный факт:\n\n{fact}")
+
+@dp.message(Command("start"))
+async def start_command(message: types.Message):
+    """Обработчик команды /start"""
+    help_text = (
+        "Привет! Я бот, который рассказывает интересные факты о числах.\n\n"
+        "Доступные команды:\n"
+        "/getnumber - факт о числе\n"
+        "/getdate - факт о дате (введите ДД.ММ)\n"
+        "/getyear - факт о годе\n"
+        "/getmath - математический факт\n"
+        "/getrandom - случайный факт\n\n"
+        "Просто выберите команду и следуйте инструкциям!"
+    )
+    await message.answer(help_text)
+
+async def main():
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
